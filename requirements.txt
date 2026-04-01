@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+scikit-learn
+imbalanced-learn
+stable-baselines3
+gymnasium

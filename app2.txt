@@ -1,0 +1,24 @@
+import streamlit as st
+import pandas as pd
+from pipeline import run_pipeline, preprocess_dataset
+
+st.title("RL-MFGWfs Fraud Detection System")
+
+file = st.file_uploader("Upload CSV", type=["csv"])
+
+if file:
+    df = pd.read_csv(file)
+    st.write("Preview:", df.head())
+
+    target = st.selectbox("Select Target Column", df.columns)
+
+    if st.button("Run Model"):
+        with st.spinner("Processing... this may take time ⏳"):
+            X, y = preprocess_dataset(df, target)
+
+            results = run_pipeline(X, y)
+
+            st.success("Done!")
+
+            st.write("### Results")
+            st.json(results)

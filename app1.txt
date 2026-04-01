@@ -1,0 +1,279 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_predict
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from imblearn.metrics import geometric_mean_score
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier
+
+# Import your RL and Gym libraries
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+import copy
+import warnings
+warnings.filterwarnings('ignore')
+
+st.set_page_config(page_title="Universal RL-MFGWfs Platform | EREKA 2026", layout="wide")
+
+# ==========================================
+# 1. CORE AI CLASSES (Embedded for Streamlit)
+# ==========================================
+class FeatureGroupingEnv(gym.Env):
+    def __init__(self, X, y, num_tasks=3):
+        super(FeatureGroupingEnv, self).__init__()
+        self.X, self.y = X, y
+        self.num_features = X.shape
+        self.num_tasks = num_tasks
+        self.current_feature_idx = 0
+        self.observation_space = spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32)
+        self.action_space = spaces.Discrete(self.num_tasks)
+        self.feature_assignments = np.full(self.num_features, -1)
+        self.selection_history = np.zeros(self.num_features)
+
+    def _get_observation(self):
+        f_idx = self.current_feature_idx
+        np.random.seed(f_idx)
+        return np.array([np.random.uniform(0.5, 1.0), 0.0, 0.5, self.selection_history[f_idx]], dtype=np.float32)
+
+    def step(self, action):
+        self.feature_assignments[self.current_feature_idx] = action
+        self.selection_history[self.current_feature_idx] += 0.1
+        self.current_feature_idx += 1
+        done = self.current_feature_idx >= self.num_features
+        reward = self._calculate_reward() if done else 0.0
+        obs = np.zeros(4, dtype=np.float32) if done else self._get_observation()
+        return obs, reward, done, False, {}
+
+    def _calculate_reward(self):
+        total_gmean = 0.0
+        active_tasks = 0
+        for t in range(self.num_tasks):
+            task_indices = np.where(self.feature_assignments == t)
+            if len(task_indices) < 3:
+                total_gmean += 0.5
+            else:
+                knn = KNeighborsClassifier(n_neighbors=3)
+                knn.fit(self.X[:, task_indices], self.y)
+                y_pred = knn.predict(self.X[:, task_indices])
+                total_gmean += geometric_mean_score(self.y, y_pred)
+            active_tasks += 1
+        if active_tasks == 0: return -20.0
+        return (total_gmean / active_tasks) * 2.0
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_feature_idx = 0
+        self.feature_assignments = np.random.randint(0, self.num_tasks, size=self.num_features)
+        return self._get_observation(), {}
+
+class MFGWfs_Scaled_CC:
+    def __init__(self, X, y, rl_task_assignments, num_wolves=10, max_iter=15): # Reduced for web speed
+        self.X, self.y = X, y
+        self.total_features = X.shape
+        self.task_assignments = rl_task_assignments
+        self.num_tasks = 3 
+        self.num_wolves = num_wolves
+        self.max_iter = max_iter
+        self.rmp = 0.3
+        self.tasks_features, self.populations = {}, {}
+        self.alpha_pos, self.alpha_score = {}, {}
+        self.beta_pos, self.beta_score = {}, {}
+        self.delta_pos, self.delta_score = {}, {}
+        self.fitness_history = []
+
+        for t in range(self.num_tasks):
+            self.tasks_features[t] = np.where(self.task_assignments == t)
+            num_features = len(self.tasks_features[t])
+            self.populations[t] = np.random.randint(2, size=(self.num_wolves, num_features)).astype(float)
+            self.alpha_pos[t], self.beta_pos[t], self.delta_pos[t] = np.zeros(num_features), np.zeros(num_features), np.zeros(num_features)
+            self.alpha_score[t], self.beta_score[t], self.delta_score[t] = -np.inf, -np.inf, -np.inf
+
+    def fitness_function(self, wolf_binary, task_id):
+        active_indices = np.where(wolf_binary >= 0.5)
+        selected_cols = list(self.tasks_features[task_id][active_indices])
+        for other_task in range(self.num_tasks):
+            if other_task != task_id and len(self.tasks_features[other_task]) > 0:
+                best_mask = self.alpha_pos[other_task] >= 0.5
+                if np.any(best_mask):
+                    selected_cols.extend(self.tasks_features[other_task][best_mask])
+        if len(selected_cols) == 0: return 0.0
+        selected_cols = np.unique(selected_cols).astype(int)
+        
+        # Fast evaluation
+        knn = KNeighborsClassifier(n_neighbors=3)
+        knn.fit(self.X[:, selected_cols], self.y)
+        y_pred = knn.predict(self.X[:, selected_cols])
+        return geometric_mean_score(self.y, y_pred)
+
+    def optimize(self):
+        progress_bar = st.progress(0)
+        for iteration in range(self.max_iter):
+            a = 2.0 - iteration * (2.0 / self.max_iter)
+            for t in range(self.num_tasks):
+                num_features = len(self.tasks_features[t])
+                if num_features == 0: continue
+                for i in range(self.num_wolves):
+                    score = self.fitness_function(self.populations[t][i], t)
+                    if score > self.alpha_score[t]:
+                        self.delta_score[t], self.delta_pos[t] = self.beta_score[t], copy.deepcopy(self.beta_pos[t])
+                        self.beta_score[t], self.beta_pos[t] = self.alpha_score[t], copy.deepcopy(self.alpha_pos[t])
+                        self.alpha_score[t], self.alpha_pos[t] = score, copy.deepcopy(self.populations[t][i])
+                    elif score > self.beta_score[t]:
+                        self.delta_score[t], self.delta_pos[t] = self.beta_score[t], copy.deepcopy(self.beta_pos[t])
+                        self.beta_score[t], self.beta_pos[t] = score, copy.deepcopy(self.populations[t][i])
+                    elif score > self.delta_score[t]:
+                        self.delta_score[t], self.delta_pos[t] = score, copy.deepcopy(self.populations[t][i])
+
+            # Update wolves
+            for t in range(self.num_tasks):
+                num_features = len(self.tasks_features[t])
+                if num_features == 0: continue
+                for i in range(self.num_wolves):
+                    for j in range(num_features):
+                        r1, r2 = np.random.rand(), np.random.rand()
+                        A1, C1 = 2 * a * r1 - a, 2 * r2
+                        D_alpha = abs(C1 * self.alpha_pos[t][j] - self.populations[t][i][j])
+                        X1 = self.alpha_pos[t][j] - A1 * D_alpha
+                        # Simplified update for web speed
+                        new_pos = X1 
+                        sigmoid = 1.0 / (1.0 + np.exp(-10 * (new_pos - 0.5)))
+                        self.populations[t][i][j] = 1 if sigmoid > np.random.rand() else 0
+
+            # Record best score for graphs
+            best_iter_score = max([self.alpha_score[t] for t in range(self.num_tasks) if self.alpha_score[t] != -np.inf], default=0)
+            self.fitness_history.append(best_iter_score)
+            progress_bar.progress((iteration + 1) / self.max_iter)
+            
+        progress_bar.empty()
+
+# ==========================================
+# 2. UI AND WORKFLOW
+# ==========================================
+st.title("🧬 Universal AI Biomarker Discovery (RL-MFGWfs)")
+st.markdown("Upload **ANY** dataset to dynamically select the best features and train a model.")
+
+st.sidebar.header("1. Dataset Configuration")
+uploaded_file = st.sidebar.file_uploader("Upload CSV Dataset", type=["csv"])
+
+dataset_format = st.sidebar.radio(
+    "How is your dataset structured?",
+    ("Microarray (Genes = Rows, Patients = Cols)", "Standard ML (Patients = Rows, Features = Cols)")
+)
+
+if uploaded_file is not None:
+    # --- DYNAMIC DATA LOADING ---
+    try:
+        # IMPORTANT: Always rewind the file to the beginning before reading
+        uploaded_file.seek(0) 
+        
+        if dataset_format == "Microarray (Genes = Rows, Patients = Cols)":
+            df = pd.read_csv(uploaded_file, header=None)
+            y_raw_str = df.iloc.values
+            X_raw = df.iloc[1:].values.T.astype(float)
+        else:
+            # Assume last column is target, first row is headers
+            df = pd.read_csv(uploaded_file)
+            y_raw_str = df.iloc[:, -1].values
+            X_raw = df.iloc[:, :-1].values.astype(float)
+            
+        # Dynamically encode any text labels (e.g., Tumor/Normal -> 1/0)
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y_raw_str)
+        classes = le.classes_
+        
+        st.write(f"### Dataset Loaded Successfully")
+        st.write(f"- **Samples (Patients/Instances):** {X_raw.shape}")
+        st.write(f"- **Raw Features:** {X_raw.shape}")
+        st.write(f"- **Classes Detected:** {classes} (0) vs {classes} (1)")
+        
+        if st.button("🚀 Start AI Discovery Pipeline", use_container_width=True):
+            
+            # --- STEP 1: PRE-FILTER ---
+            with st.status("Step 1: ANOVA Pre-Filtering...", expanded=True) as status:
+                selector = SelectKBest(score_func=f_classif, k=min(30, X_raw.shape))
+                X_filtered = selector.fit_transform(X_raw, y_encoded)
+                top_30_indices = selector.get_support(indices=True)
+                st.write(f"Reduced to top {X_filtered.shape} statistical features.")
+                
+                # --- STEP 2: RL AGENT ---
+                st.write("Step 2: Reinforcement Learning Grouping...")
+                env = FeatureGroupingEnv(X_filtered, y_encoded, num_tasks=3)
+                model = PPO("MlpPolicy", env, ent_coef=0.1, verbose=0)
+                model.learn(total_timesteps=3000) # Fast for web
+                
+                obs, _ = env.reset()
+                for _ in range(X_filtered.shape):
+                    action, _ = model.predict(obs, deterministic=True)
+                    obs, _, _, _, _ = env.step(action)
+                final_grouping = env.feature_assignments
+                st.write(f"RL Agent created feature groups: {final_grouping}")
+                
+                # --- STEP 3: WOLF OPTIMIZATION ---
+                st.write("Step 3: Grey Wolf Cooperative Hunt...")
+                mfgwfs = MFGWfs_Scaled_CC(X_filtered, y_encoded, final_grouping, num_wolves=10, max_iter=20)
+                mfgwfs.optimize()
+                
+                combined_features = []
+                for t in range(mfgwfs.num_tasks):
+                    if len(mfgwfs.tasks_features[t]) > 0:
+                        best_wolf_mask = mfgwfs.alpha_pos[t] == 1
+                        combined_features.extend(mfgwfs.tasks_features[t][best_wolf_mask])
+                final_golden_indices = np.unique(combined_features).astype(int)
+                
+                status.update(label="AI Optimization Complete!", state="complete", expanded=False)
+
+            # --- STEP 4: DISPLAY RESULTS & GRAPHS ---
+            if len(final_golden_indices) > 0:
+                st.success(f"🎉 AI successfully reduced the dataset to **{len(final_golden_indices)} Golden Features**!")
+                
+                # Determine original indices
+                original_dataset_indices = top_30_indices[final_golden_indices]
+                st.write("### The 'Why': Selected Feature Indices")
+                st.info(f"The algorithm selected these specific original columns as the most highly predictive, non-redundant biomarkers: \n**{original_dataset_indices.tolist()}**")
+                
+                # --- GRAPH 1: Convergence Curve ---
+                st.subheader("📊 Optimization Analytics")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig1, ax1 = plt.subplots(figsize=(6, 4))
+                    ax1.plot(mfgwfs.fitness_history, marker='o', color='b')
+                    ax1.set_title("Grey Wolf Convergence Curve")
+                    ax1.set_xlabel("Iteration")
+                    ax1.set_ylabel("Best G-Mean Fitness")
+                    ax1.grid(True)
+                    st.pyplot(fig1)
+                
+                # --- GRAPH 2: Baseline Comparison ---
+                with col2:
+                    # Evaluate Baseline (All 30 filtered)
+                    X_train, X_test, y_train, y_test = train_test_split(X_filtered, y_encoded, test_size=0.3, random_state=42)
+                    base_rf = RandomForestClassifier(random_state=42).fit(X_train, y_train)
+                    base_acc = accuracy_score(y_test, base_rf.predict(X_test))
+                    
+                    # Evaluate Golden Features
+                    X_train_gold = X_train[:, final_golden_indices]
+                    X_test_gold = X_test[:, final_golden_indices]
+                    gold_rf = RandomForestClassifier(random_state=42).fit(X_train_gold, y_train)
+                    gold_acc = accuracy_score(y_test, gold_rf.predict(X_test_gold))
+                    
+                    fig2, ax2 = plt.subplots(figsize=(6, 4))
+                    ax2.bar(['Baseline (All Features)', f'RL-MFGWfs ({len(final_golden_indices)} Features)'], [base_acc, gold_acc], color=['lightcoral', 'royalblue'])
+                    ax2.set_title("Generalization Accuracy Comparison")
+                    ax2.set_ylabel("Accuracy")
+                    ax2.set_ylim(0, 1.1)
+                    st.pyplot(fig2)
+                    
+            else:
+                st.error("The optimization failed to find a valid subset. Try running it again.")
+
+    except Exception as e:
+        st.error(f"Error parsing dataset. Please ensure the format matches your selection. Details: {e}")
