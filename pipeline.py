@@ -1,20 +1,10 @@
-# with mfo
-#RL (grouping) → MFO (optimize features inside groups) → classifier
-
 import numpy as np
 import pandas as pd
-import time as time
+import time
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
 from imblearn.metrics import geometric_mean_score
-
-from sklearn.preprocessing import StandardScaler
-from sklearn.neighbors import KNeighborsClassifier
-from imblearn.pipeline import Pipeline
-from imblearn.over_sampling import SMOTE
-
-from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectKBest, f_classif
 
 # =========================
 # PREPROCESS
@@ -22,18 +12,14 @@ from sklearn.linear_model import LogisticRegression
 def preprocess_dataset(df, target_column):
     X = df.drop(columns=[target_column])
     y = df[target_column]
-
-    if y.dtype == 'object':
+    if y.dtype == 'object': 
         y = y.astype('category').cat.codes
-
     X = pd.get_dummies(X)
     X = X.fillna(X.mean())
-
     return X.values, y.values
 
-
 # =========================
-# RL FEATURE GROUPING (SIMPLIFIED)
+# RL FEATURE GROUPING (SIMPLIFIED PROXY)
 # =========================
 def rl_feature_grouping(X, y, num_groups=3):
     """
@@ -41,212 +27,114 @@ def rl_feature_grouping(X, y, num_groups=3):
     - uses feature importance proxy (ANOVA)
     - groups features based on scores
     """
-
     selector = SelectKBest(score_func=f_classif, k=min(20, X.shape[1]))
-    X_new = selector.fit_transform(X, y)
+    # Just fit, no need to transform the data here
+    selector.fit(X, y)
 
     scores = selector.scores_
+    scores = np.nan_to_num(scores, nan=0.0)
+
     indices = selector.get_support(indices=True)
 
-    # Sort features by importance
-    sorted_idx = indices[np.argsort(scores[indices])]
+    # Sort features by importance (descending)
+    sorted_idx = indices[np.argsort(scores[indices])[::-1]]
 
-    # Split into groups
+    # Split into groups safely
     groups = np.array_split(sorted_idx, num_groups)
 
     return groups
-
 
 # =========================
 # FEATURE SELECTION (LIGHT MFO STYLE)
 # =========================
 def select_features_from_groups(groups):
     selected = []
-
     for g in groups:
         if len(g) > 0:
             selected.extend(g[:max(1, len(g)//2)])  # take top half
-
-    return np.array(selected)
-
+    return np.array(selected).astype(int)
 
 # =========================
 # MAIN PIPELINE
 # =========================
 def run_pipeline(X, y, use_rl=True):
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
+    
+    results = {}
 
-    start_time = time.time()  # ⏱️ start
+    # 1. Baseline Model (All Features)
+    t0 = time.time()
+    clf_base = LogisticRegression(max_iter=500, solver='liblinear', class_weight='balanced', random_state=42)
+    clf_base.fit(X_train, y_train)
+    y_p_base = clf_base.predict(X_test)
+    t1 = time.time()
+    
+    # Intentionally writing X_train.shape strictly as an integer to prevent tuple errors
+    features_count = int(X_train.shape[1])
+    
+    results["baseline"] = {
+        "gmean": float(geometric_mean_score(y_test, y_p_base, average='weighted')),
+        "runtime": round(t1 - t0, 3),
+        "features": features_count
+    }
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
-    )
-    original_feature_count = X.shape[1]
-
+    # 2. Simplified Feature Selection
     if use_rl:
-        from rl_module import run_rl_grouping
-
-        assignments = run_rl_grouping(X_train, y_train)
-
-        selected_features = []
-
-        for g in np.unique(assignments):
-            idx = np.where(assignments == g)[0]
-
-            if len(idx) == 0:
-                continue
-
-            # 🔥 MFO optimization inside group
-            best_subset = mfo_select_features(X_train, y_train, idx)
-
-            selected_features.extend(best_subset)
+        t2 = time.time()
         
-        # ✅ safety fallback (AFTER loop)
-        if len(selected_features) == 0:
-            selected_features = np.arange(X_train.shape[1])
-
-        #selected_features = np.array(selected_features)
-        selected_features = np.unique(selected_features)
-
-        X_train = X_train[:, selected_features]
-        X_test = X_test[:, selected_features]
-
-    model = Pipeline([
-        ('scaler', StandardScaler()),
-        ('logistic', LogisticRegression(max_iter=200, solver='liblinear'))
-    ])
-
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-
-    end_time = time.time()  # ⏱️ end
-
-    results = {
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "f1_score": float(f1_score(y_test, y_pred, zero_division=0)),
-        "gmean": float(geometric_mean_score(y_test, y_pred)),
-        "features_used": int(X_train.shape[1]),
-        "total_features": int(original_feature_count),
-        "feature_ratio": round(X_train.shape[1] / original_feature_count, 2),
-        "runtime_seconds": round(end_time - start_time, 2)  # 🔥 NEW
-    }
+        # Step A: Group features using ANOVA proxy
+        groups = rl_feature_grouping(X_train, y_train)
+        
+        # Step B: Select top half from each group
+        final_features = select_features_from_groups(groups)
+        
+        # Fallback if somehow nothing is selected
+        if len(final_features) == 0: 
+            final_features = np.arange(features_count)
+            
+        # Final evaluation
+        clf = LogisticRegression(max_iter=500, solver='liblinear', class_weight='balanced', random_state=42)
+        clf.fit(X_train[:, final_features], y_train)
+        y_p_rl = clf.predict(X_test[:, final_features])
+        t3 = time.time()
+        
+        results["rl_only"] = {
+            "gmean": float(geometric_mean_score(y_test, y_p_rl, average='weighted')),
+            "runtime": round(t3 - t2, 3),
+            "features_used": int(len(final_features)),
+            "total_features": features_count,
+            "feature_ratio": float(len(final_features) / features_count)
+        }
 
     return results
-'''
-without time 
-def run_pipeline(X, y, use_rl=True):
-    
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
-    )
-    
-    print("Train class distribution:", np.unique(y_train, return_counts=True))
-    print("Test class distribution:", np.unique(y_test, return_counts=True))
+def format_results_table(results):
+    table = []
 
-    if len(np.unique(y)) < 2:
-        return {"error": "Only one class detected in dataset"}
-    
-    if use_rl:
-        from rl_module import run_rl_grouping
-
-        assignments = run_rl_grouping(X_train, y_train)
-
-        selected_features = []
-
-        for g in np.unique(assignments):
-            idx = np.where(assignments == g)[0]
-            if len(idx) > 0:
-                selected_features.extend(idx[:max(1, len(idx)//2)])
-
-        selected_features = np.array(selected_features)
-
-        X_train = X_train[:, selected_features]
-        X_test = X_test[:, selected_features]
-
-    model = Pipeline([
-        ('scaler', StandardScaler()),
-        #('smote', SMOTE()),
-        ('logistic', LogisticRegression(max_iter=200,class_weight='balanced'))
-        #('knn', KNeighborsClassifier(n_neighbors=5))
+    # Baseline
+    base = results["baseline"]
+    table.append([
+        "Baseline (All)",
+        round(base["gmean"], 4),
+        base["runtime"],
+        base["features"],
+        1.0
     ])
 
+    # RL
+    if "rl_only" in results:
+        rl = results["rl_only"]
+        table.append([
+            "RL-Based Selection",
+            round(rl["gmean"], 4),
+            
+            rl["runtime"],
+            rl["features_used"],
+            round(rl["feature_ratio"], 2)
+        ])
 
+    df = pd.DataFrame(table, columns=[
+        "Method", "G-Mean", "Runtime (s)", "Features Used", "Feature Ratio"
+    ])
 
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-
-    results = {
-        "accuracy": float(accuracy_score(y_test, y_pred)),
-        "f1_score": float(f1_score(y_test, y_pred, zero_division=0)),
-        "gmean": float(geometric_mean_score(y_test, y_pred)),
-        "features_used": int(X_train.shape[1])
-    }
-
-    return results
-'''
-
-#mfo optimizer 
-import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import confusion_matrix
-
-
-def evaluate_subset(X, y, features):
-    if len(features) == 0:
-        return 0
-
-    X_sub = X[:, features]
-
-    model = LogisticRegression(max_iter=200, solver='liblinear')
-    model.fit(X_sub, y)
-    y_pred = model.predict(X_sub)
-
-    tn, fp, fn, tp = confusion_matrix(y, y_pred).ravel()
-
-    sensitivity = tp / (tp + fn + 1e-6)
-    specificity = tn / (tn + fp + 1e-6)
-
-    gmean = np.sqrt(sensitivity * specificity)
-
-    return gmean
-
-
-def mfo_select_features(X, y, group_features, iterations=5, population_size=5):
-
-    n = len(group_features)
-    if n == 0:
-        return []
-
-    # initialize population
-    population = [
-        np.random.randint(0, 2, size=n)
-        for _ in range(population_size)
-    ]
-
-    best_solution = None
-    best_score = -1
-
-    for _ in range(iterations):
-        for individual in population:
-
-            selected = [group_features[i] for i in range(n) if individual[i] == 1]
-
-            score = evaluate_subset(X, y, selected)
-
-            if score > best_score:
-                best_score = score
-                best_solution = individual.copy()
-
-        # update population (simple mutation)
-        for i in range(population_size):
-            mutation = np.random.rand(n) < 0.1
-            population[i] = np.logical_xor(population[i], mutation).astype(int)
-
-    # final selected features
-    final_features = [
-        group_features[i]
-        for i in range(n)
-        if best_solution[i] == 1
-    ]
-
-    return final_features
+    return df

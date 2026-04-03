@@ -1,11 +1,8 @@
-# with mfo
-#RL (grouping) → MFO (optimize features inside groups) → classifier
-
 import streamlit as st
 import pandas as pd
-from pipeline import preprocess_dataset, run_pipeline
+from pipeline import preprocess_dataset, run_pipeline, format_results_table
 
-st.title("RL-MFGWfs Fraud Detection System")
+st.title("RL Feature Selection System")
 
 file = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -14,52 +11,43 @@ if file:
     st.write("Preview:", df.head())
 
     target = st.selectbox("Select Target Column", df.columns)
-
-    sample_option = st.selectbox(
-        "Select sample size",
-        ["5000", "10000", "20000", "Full dataset"]
-        #["10000", "20000", "50000", "Full dataset"]
-    )
-
-    use_rl = st.checkbox("Enable RL Feature Grouping", value=True)
+    sample_option = st.selectbox("Select sample size", ["5000", "10000", "20000", "Full dataset"])
+    use_rl = st.checkbox("Enable RL Feature Selection", value=True)
 
     if st.button("Run Model"):
-        with st.spinner("Processing... this may take time ⏳"):
-
-            # Sampling
+        with st.spinner("Processing ... this may take time ⏳"):
             if sample_option != "Full dataset":
                 size = int(sample_option)
-
                 if len(df) > size:
-                    df = df.groupby(target).apply(
+                    df = df.groupby(target, group_keys=False).apply(
                         lambda x: x.sample(min(len(x), size // 2), random_state=42)
                     ).reset_index(drop=True)
-
-                    st.warning(f"Using BALANCED sample of {size} rows")
+                    st.warning(f"Using BALANCED sample of {len(df)} rows")
         
             X, y = preprocess_dataset(df, target)
 
-            results = run_pipeline(X, y, use_rl=use_rl)
-            st.metric("Runtime (seconds)", results["runtime_seconds"])
-            st.metric(
-                "Feature Usage",
-                f"{results['features_used']} / {results['total_features']}"
-            )
+            # Pass our simplified flags
+            all_results = run_pipeline(X, y, use_rl=use_rl)
 
-            st.metric(
-                "Feature Reduction",
-                f"{(1 - results['feature_ratio']) * 100:.1f}%"
-            )
+            # Display Baseline
+            st.subheader("🚀 Baseline")
+            st.write(f"G-Mean: {all_results['baseline']['gmean']:.4f}")
+            st.write(f"Time: {all_results['baseline']['runtime']}s")
 
-            st.success("Done!")
+            # Display RL Only if enabled
+            if "rl_only" in all_results:
+                st.subheader("🧠 RL Feature Selection")
+                st.write(f"G-Mean: {all_results['rl_only']['gmean']:.4f}")
+                st.write(f"Time: {all_results['rl_only']['runtime']}s")
+                
+                # Show comparison
+                diff = all_results['rl_only']['gmean'] - all_results['baseline']['gmean']
+                st.metric("G-Mean Improvement", f"{diff:.4f}")
 
-            st.write("### Results")
-            st.json(results)
+            
 
-            '''
-            if sample_option != "Full dataset":
-                size = int(sample_option)
-                if len(df) > size:
-                    df = df.sample(size, random_state=42)
-                    st.warning(f"Using sample of {size} rows")
-        '''
+            table = format_results_table(all_results)
+            st.subheader("Model Comparison Results:")
+            st.dataframe(table)
+
+            st.json(all_results)
